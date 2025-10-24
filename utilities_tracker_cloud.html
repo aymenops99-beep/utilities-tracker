@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Utilities Tracker — Cloud Synced</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin:20px; background:#f7f7fb; color:#222; }
+    h1 { margin:0 0 6px; font-size:1.6rem; }
+    .muted { color:#666; font-size:0.95rem; margin-bottom:12px; }
+    .card { background:#fff; border-radius:8px; padding:14px; box-shadow:0 2px 8px rgba(0,0,0,0.06); margin-bottom:16px; }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; }
+    label.small { display:block; font-size:0.85rem; color:#444; margin-bottom:6px; }
+    input[type="month"], input[type="number"], select { padding:8px 10px; border-radius:6px; border:1px solid #ddd; }
+    button { padding:8px 12px; border-radius:8px; border:none; background:#2b6cb0; color:white; cursor:pointer; }
+    button.secondary { background:#6b7280; }
+    button.danger { background:#c53030; }
+    table { width:100%; border-collapse: collapse; margin-top:12px; }
+    th, td { padding:8px 10px; border-bottom:1px solid #eee; text-align:left; }
+    th { background:#fafafa; font-weight:600; }
+    .chart-row { display:flex; gap:18px; flex-wrap:wrap; }
+    .chart { flex:1 1 420px; min-width:300px; }
+    .small-note { font-size:0.9rem; color:#555; }
+    .status { font-size:0.9rem; color:#2f855a; }
+    .error { color:#c53030; }
+    .spinner { display:inline-block; width:14px; height:14px; border:2px solid rgba(0,0,0,0.12); border-top-color:#2b6cb0; border-radius:50%; animation:spin 0.9s linear infinite; vertical-align:middle; margin-left:8px; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Utilities Tracker — Cloud Synced</h1>
+  <div class="muted">Enter monthly electricity (kWh) and water (m³). Data is saved to your Google Sheet and loads across devices.</div>
+
+  <div class="card controls" style="align-items:flex-end;">
+    <div>
+      <label class="small">Month</label>
+      <input id="monthInput" type="month" />
+    </div>
+    <div>
+      <label class="small">Electricity (kWh)</label>
+      <input id="elecInput" type="number" step="0.01" min="0" placeholder="kWh" />
+    </div>
+    <div>
+      <label class="small">Water (m³)</label>
+      <input id="waterInput" type="number" step="0.01" min="0" placeholder="m³" />
+    </div>
+    <div style="display:flex; flex-direction:column; gap:8px;">
+      <button id="addBtn">Add / Update</button>
+      <button id="refreshBtn" class="secondary">Refresh from sheet</button>
+    </div>
+    <div style="margin-left:auto; text-align:right;">
+      <div class="small-note">Connected to Google Apps Script Web App</div>
+      <div id="status" class="status">Ready</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 8px;">Data table</h3>
+    <div class="small-note">Double-click a row to load it into the entry fields for editing.</div>
+    <table id="dataTable">
+      <thead>
+        <tr><th>Month (YYYY-MM)</th><th>Electricity (kWh)</th><th>Water (m³)</th><th>Actions</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="chart-row">
+    <div class="card chart">
+      <h3 style="margin-top:0;">Electricity (kWh)</h3>
+      <canvas id="elecChart" height="160"></canvas>
+    </div>
+    <div class="card chart">
+      <h3 style="margin-top:0;">Water (m³)</h3>
+      <canvas id="waterChart" height="160"></canvas>
+    </div>
+  </div>
+
+<script>
+/* -------------------------
+   CONFIG — replace WEB_APP_URL with your Apps Script URL
+   ------------------------- */
+const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbzPPJSBVosf-iD2-GlBGlwRadq3gStF0f7R1-0RkDqeNnSN8JysYFWtHQyTR8aluuM3/exec";
+
+/* -------------------------
+   UI elements
+   ------------------------- */
+const monthInput = document.getElementById('monthInput');
+const elecInput = document.getElementById('elecInput');
+const waterInput = document.getElementById('waterInput');
+const addBtn = document.getElementById('addBtn');
+const refreshBtn = document.getElementById('refreshBtn');
+const statusDiv = document.getElementById('status');
+const tableBody = document.querySelector('#dataTable tbody');
+
+/* Set default month to current */
+monthInput.value = new Date().toISOString().slice(0,7);
+
+/* Chart.js setup */
+const elecCtx = document.getElementById('elecChart').getContext('2d');
+const waterCtx = document.getElementById('waterChart').getContext('2d');
+
+const elecChart = new Chart(elecCtx, {
+  type: 'line',
+  data: { labels: [], datasets: [{ label: 'Electricity (kWh)', data: [], fill:false, tension:0.3, pointRadius:4 }]},
+  options: { responsive:true, scales:{ x:{ title:{display:true, text:'Month'}}, y:{ title:{display:true, text:'kWh'} } }, plugins:{legend:{display:false}} }
+});
+
+const waterChart = new Chart(waterCtx, {
+  type: 'line',
+  data: { labels: [], datasets: [{ label: 'Water (m³)', data: [], fill:false, tension:0.3, pointRadius:4 }]},
+  options: { responsive:true, scales:{ x:{ title:{display:true, text:'Month'}}, y:{ title:{display:true, text:'m³'} } }, plugins:{legend:{display:false}} }
+});
+
+/* State */
+let rows = []; // array of { month, electricity, water }
+
+/* Helpers */
+function setStatus(txt, isError=false) {
+  statusDiv.textContent = txt;
+  statusDiv.className = isError ? 'error' : 'status';
+}
+
+function showSpinner(msg) {
+  setStatus(msg);
+  const s = document.createElement('span');
+  s.className = 'spinner';
+  statusDiv.appendChild(s);
+}
+
+/* Load data from Google Sheet via GET */
+async function loadData() {
+  try {
+    setStatus('Loading from sheet...');
+    const resp = await fetch(WEB_APP_URL);
+    if (!resp.ok) throw new Error('Failed to fetch data: ' + resp.status);
+    const json = await resp.json();
+    // json is array of objects {month, electricity, water}
+    rows = json.map(r => ({
+      month: (r.month || '').toString(),
+      electricity: r.electricity === '' || r.electricity === undefined ? null : parseFloat(r.electricity),
+      water: r.water === '' || r.water === undefined ? null : parseFloat(r.water)
+    }))
+    // Filter invalid months and sort
+    rows = rows.filter(r => r.month).sort((a,b) => a.month.localeCompare(b.month));
+    renderTable();
+    updateCharts();
+    setStatus('Loaded ' + rows.length + ' rows.');
+  } catch (err) {
+    console.error(err);
+    setStatus('Error loading data. Check Apps Script deployment and permissions.', true);
+  }
+}
+
+/* Render table */
+function renderTable() {
+  tableBody.innerHTML = '';
+  rows.forEach((r, idx) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.month}</td>
+      <td>${r.electricity !== null && r.electricity !== undefined ? r.electricity : ''}</td>
+      <td>${r.water !== null && r.water !== undefined ? r.water : ''}</td>
+      <td>
+        <button class="editBtn" data-idx="${idx}">Edit</button>
+        <button class="deleteBtn" data-idx="${idx}">Delete</button>
+      </td>
+    `;
+    tableBody.appendChild(tr);
+  });
+  // bind buttons
+  tableBody.querySelectorAll('.editBtn').forEach(b => {
+    b.addEventListener('click', () => {
+      const i = parseInt(b.dataset.idx,10);
+      const row = rows[i];
+      monthInput.value = row.month;
+      elecInput.value = row.electricity === null ? '' : row.electricity;
+      waterInput.value = row.water === null ? '' : row.water;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  });
+  tableBody.querySelectorAll('.deleteBtn').forEach(b => {
+    b.addEventListener('click', async () => {
+      const i = parseInt(b.dataset.idx,10);
+      const r = rows[i];
+      if (!confirm('Delete month ' + r.month + ' ?')) return;
+      // To "delete" we'll send empty values for that month (Apps Script will update the row)
+      await postData({ month: r.month, electricity: '', water: '' });
+      await loadData();
+    });
+  });
+
+  // double-click row to edit
+  tableBody.querySelectorAll('tr').forEach(tr => {
+    tr.addEventListener('dblclick', () => {
+      const m = tr.cells[0].textContent.trim();
+      const found = rows.find(x => x.month === m);
+      if (found) {
+        monthInput.value = found.month;
+        elecInput.value = found.electricity === null ? '' : found.electricity;
+        waterInput.value = found.water === null ? '' : found.water;
+      }
+    });
+  });
+}
+
+/* Update charts */
+function updateCharts() {
+  const labels = rows.map(r => r.month);
+  const elecData = rows.map(r => r.electricity === null ? null : r.electricity);
+  const waterData = rows.map(r => r.water === null ? null : r.water);
+
+  elecChart.data.labels = labels;
+  elecChart.data.datasets[0].data = elecData;
+  elecChart.update();
+
+  waterChart.data.labels = labels;
+  waterChart.data.datasets[0].data = waterData;
+  waterChart.update();
+}
+
+/* POST (add/update) */
+async function postData(obj) {
+  try {
+    showSpinner('Saving...');
+    const resp = await fetch(WEB_APP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(obj)
+    });
+    if (!resp.ok) throw new Error('Save failed: ' + resp.status);
+    const resJson = await resp.json();
+    setStatus('Saved.');
+    return resJson;
+  } catch (err) {
+    console.error(err);
+    setStatus('Error saving data.', true);
+  }
+}
+
+/* Handlers */
+addBtn.addEventListener('click', async () => {
+  const month = monthInput.value;
+  if (!month) { alert('Please choose a month.'); return; }
+  const elec = elecInput.value === '' ? '' : parseFloat(elecInput.value);
+  const water = waterInput.value === '' ? '' : parseFloat(waterInput.value);
+  await postData({ month, electricity: elec, water: water });
+  await loadData();
+});
+
+refreshBtn.addEventListener('click', loadData);
+
+/* Initial load */
+loadData();
+
+</script>
+</body>
+</html>
